@@ -5,6 +5,7 @@
 target
 *.class
 *.log
+*.csv
 
 
 # Idea
