@@ -8,4 +8,8 @@ libraryDependencies ++= Seq(
   "com.opencsv" % "opencsv" % "3.7",
   "com.github.scopt" %% "scopt" % "3.4.+",
   "com.typesafe.akka" %% "akka-http-core" % "2.4.6",
+  "org.consensusresearch" % "scrypto_2.11" % "1.0.+",
   "org.consensusresearch" %% "scorex-transaction" % "1.2.7")
+
+assemblyJarName in assembly := "tx-gen.jar"
+mainClass in assembly := Some("com.wavesplatform.txgenerator.TxGenerator")
