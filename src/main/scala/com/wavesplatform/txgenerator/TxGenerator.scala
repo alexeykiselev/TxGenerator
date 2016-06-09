@@ -5,7 +5,8 @@ import java.io.{File, FileReader, FileWriter}
 import com.google.common.primitives.{Bytes, Ints}
 import com.opencsv.{CSVReader, CSVWriter}
 import dispatch._, Defaults._
-import org.joda.time._
+import org.joda.time.{Duration => JodaDuration}
+import org.joda.time.{DateTime}
 import play.api.libs.json._
 import scopt.OptionParser
 import scorex.account.{Account, PrivateKeyAccount}
@@ -14,6 +15,8 @@ import scorex.transaction.PaymentTransaction
 
 import scala.annotation.tailrec
 import scala.collection.JavaConversions._
+import scala.concurrent.Await
+import scala.concurrent.duration._
 import scala.io.StdIn
 import scala.util.Try
 
@@ -29,6 +32,7 @@ case class TxGeneratorConfiguration(mode: Mode = SeedGeneration,
                                     transactions: File = new File("transaction.csv"),
                                     output: File = new File("output.csv"),
                                     seed: Array[Byte] = Array[Byte](),
+                                    accountSeed: Array[Byte] = Array[Byte](),
                                     privateKey: Array[Byte] = Array[Byte](),
                                     publicKey: Array[Byte] = Array[Byte](),
                                     offset: Long = 0,
@@ -46,8 +50,13 @@ object TxGenerator extends App {
       head("TxGenerator - Waves transactions generator", "v1.0.0")
       cmd("seed") action { (_, c) =>
         c.copy(mode = SeedGeneration)
-      } text "Generate seed" children (
-        opt[Int]('n', "nonce") valueName "<nonce>" action { (x, c) => c.copy(nonce = x) } text "address generation nonce")
+      } text "Generate seed" children(
+        opt[Int]('n', "nonce") valueName "<nonce>" action { (x, c) => c.copy(nonce = x) } text "address generation nonce",
+        opt[String]('s', "seed") valueName "<seed>" action { (x, c) =>
+          c.copy(seed = if (Base58.decode(x).isSuccess) Base58.decode(x).get else Array[Byte]())
+        } validate { x =>
+          if (!x.isEmpty) success else failure("Invalid Base58 string for sender account seed")
+        } text "previously generated seed")
       cmd("generate") action { (_, c) =>
         c.copy(mode = TransactionGeneration)
       } text "Generate transactions" children(
@@ -59,8 +68,8 @@ object TxGenerator extends App {
         opt[File]('o', "output") required() valueName "<output-file>" action { (x, c) =>
           c.copy(output = x)
         } text "path to file to write transactions",
-        opt[String]('s', "seed") required() valueName "<sender-seed>" action { (x, c) =>
-          c.copy(seed = if (Base58.decode(x).isSuccess) Base58.decode(x).get else Array[Byte]())
+        opt[String]('s', "acc-seed") required() valueName "<account-seed>" action { (x, c) =>
+          c.copy(accountSeed = if (Base58.decode(x).isSuccess) Base58.decode(x).get else Array[Byte]())
         } validate { x =>
           if (!x.isEmpty) success else failure("Invalid Base58 string for sender account seed")
         } text "sender private account seed as Base58 string",
@@ -103,13 +112,16 @@ object TxGenerator extends App {
       case Some(config) => {
         config.mode match {
           case SeedGeneration =>
-            println("Please, enter the first text (Empty line to finish):")
-            val textA = readConsole(Vector[String]())
+            val seed: Array[Byte] = if (config.seed.isEmpty) {
+              println("Please, enter the first text (Empty line to finish):")
+              val textA = readConsole(Vector[String]())
 
-            println("Enter the second text (Empty line to finish):")
-            val textB = readConsole(Vector[String]())
+              println("Enter the second text (Empty line to finish):")
+              val textB = readConsole(Vector[String]())
 
-            val seed = SeedGenerator.generateSeed(textA.mkString("\n"), textB.mkString("\n"))
+              SeedGenerator.generateSeed(textA.mkString("\n"), textB.mkString("\n"))
+            } else config.seed
+
             val seedString = Base58.encode(seed)
             println(s"Seed: $seedString")
 
@@ -142,7 +154,7 @@ object TxGenerator extends App {
               val address = row(0).trim
               val amount = row(1).trim.toLong
 
-              createTransaction(config.seed, config.privateKey, config.publicKey, address, amount, config.offset) match {
+              createTransaction(config.accountSeed, config.privateKey, config.publicKey, address, amount, config.offset) match {
                 case Some(transaction) =>
                   created += 1
                   val time = new DateTime(transaction.timestamp).toDateTime.toString()
@@ -184,19 +196,34 @@ object TxGenerator extends App {
 
                   val now = DateTime.now
                   if (time.isBefore(now)) {
-                    val transaction = PaymentTransaction.parseBytes(transactionBytes.tail)
+                    val transaction = PaymentTransaction.parseBytes(transactionBytes)
                     if (transaction.isSuccess) {
                       val request = getRequest(config.host, config.port, config.https)
 
-                      postTransaction(publicKeyString, request, transaction.get)
-                      posted += 1
+                      postTransaction(publicKeyString, request, transaction.get) match {
+                        case None =>
+                          failed += 1
+                          writer.writeNext(row)
+                        case Some(reply) =>
+                          val json = Json.parse(reply)
+                          val signature = (json \ "signature").get.as[String]
+                          println(s"SIGNATURE: $signature")
+                          posted += 1
+                          Thread.sleep(15000)
+                          checkTransaction(request, signature) match {
+                            case Some(reply) =>
+                              println(s"REPLY: ${reply.toString}")
+                            case None =>
+                              println("FUCK!")
+                          }
+                      }
                     } else {
                       println(s"Failed to deserialize transaction from string '$transactionString'")
                       writer.writeNext(row)
                       failed += 1
                     }
                   } else {
-                    val diff = new Duration(now, time)
+                    val diff = new JodaDuration(now, time)
                     val minutes = diff.getStandardMinutes
                     println(s"Skipping future transaction with signature '$signatureString', wait for $minutes minutes to try again")
                     writer.writeNext(row)
@@ -208,6 +235,8 @@ object TxGenerator extends App {
             }
             println(s"Transactions posted: $posted")
             println(s"Failed to post $failed transactions")
+
+            Http.shutdown()
         }
       }
       case None =>
@@ -240,7 +269,7 @@ object TxGenerator extends App {
     if (secured) host(h, port).secure else host(h, port)
   }
 
-  def postTransaction(senderPublicKey: String, req: Req, transaction: PaymentTransaction): String = {
+  def postTransaction(senderPublicKey: String, req: Req, transaction: PaymentTransaction): Option[String] = {
     val signatureBase58 = Base58.encode(transaction.signature)
     val recipientBase58 = Base58.encode(transaction.recipient.bytes)
 
@@ -253,11 +282,17 @@ object TxGenerator extends App {
     def post = request.POST
     def requestWithContentType = post.setContentType("application/json", "UTF-8")
 
-    val reply = Http(requestWithContentType OK as.String)
-    for (r <- reply)
-      println(r)
+    val futureReply = Http(requestWithContentType OK as.String).option
 
-    signatureBase58
+    Await.result(futureReply, 5.seconds)
+  }
+
+  def checkTransaction(req: Req, signature: String): Option[String] = {
+    val request = req / "transactions" / "info" / signature
+
+    val futureReply = Http(request OK as.String).option
+
+    Await.result(futureReply, 5.seconds)
   }
 
   def getAccount(addressCandidate: String): Option[Account] = {
