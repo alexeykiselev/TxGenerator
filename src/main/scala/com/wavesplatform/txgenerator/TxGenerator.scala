@@ -4,7 +4,9 @@ import java.io.{File, FileReader, FileWriter}
 
 import com.google.common.primitives.{Bytes, Ints}
 import com.opencsv.{CSVReader, CSVWriter}
+import dispatch._, Defaults._
 import org.joda.time._
+import play.api.libs.json._
 import scopt.OptionParser
 import scorex.account.{Account, PrivateKeyAccount}
 import scorex.crypto.encode.Base58
@@ -13,6 +15,7 @@ import scorex.transaction.PaymentTransaction
 import scala.annotation.tailrec
 import scala.collection.JavaConversions._
 import scala.io.StdIn
+import scala.util.Try
 
 sealed trait Mode
 
@@ -30,12 +33,13 @@ case class TxGeneratorConfiguration(mode: Mode = SeedGeneration,
                                     publicKey: Array[Byte] = Array[Byte](),
                                     offset: Long = 0,
                                     host: String = "localhost",
-                                    port: Int = 6969,
+                                    port: Int = 6869,
                                     https: Boolean = false,
                                     limit: Int = 100,
                                     nonce: Int = 0)
 
 object TxGenerator extends App {
+
   override def main(args: Array[String]) {
 
     val parser = new OptionParser[TxGeneratorConfiguration]("txgenerator") {
@@ -71,16 +75,27 @@ object TxGenerator extends App {
           if (!x.isEmpty) success else failure("Invalid Base58 string for sender public key")
         } text "sender public key as Base58 string",
         opt[Long]('t', "offset") valueName "<timestamp-offset>" action { (x, c) =>
-          c.copy(offset = x) } text "offset to timestamp")
+          c.copy(offset = x)
+        } text "offset to timestamp")
       cmd("send") action { (_, c) =>
         c.copy(mode = TransactionSending)
       } text "Send transactions to server" children(
+        opt[File]('f', "file") required() valueName "<file>" action { (x, c) =>
+          c.copy(transactions = x)
+        } validate { x =>
+          if (x.exists()) success else failure(s"Failed to open file $x")
+        } text "path to transactions file",
         opt[String]('h', "host") required() valueName "<host>" action { (x, c) =>
           c.copy(host = x)
         } text "node host name or IP address",
         opt[Int]('p', "port") valueName "<port>" action { (x, c) => c.copy(port = x) } text "node port number",
         opt[Int]('l', "limit") valueName "<limit>" action { (x, c) => c.copy(limit = x) } text "batch transactions limit",
-        opt[Unit]('s', "https") action { (_, c) => c.copy(https = true) } text "use HTTPS connection")
+        opt[Unit]('s', "https") action { (_, c) => c.copy(https = true) } text "use HTTPS connection",
+        opt[String]('u', "public") required() valueName "<sender-public-key>" action { (x, c) =>
+          c.copy(publicKey = if (Base58.decode(x).isSuccess) Base58.decode(x).get else Array[Byte]())
+        } validate { x =>
+          if (!x.isEmpty) success else failure("Invalid Base58 string for sender public key")
+        } text "sender public key as Base58 string")
       help("help") text "display this help message"
     }
 
@@ -98,7 +113,10 @@ object TxGenerator extends App {
             val seedString = Base58.encode(seed)
             println(s"Seed: $seedString")
 
-            val accountSeed = HashChain.hash(Bytes.concat(Ints.toByteArray(config.nonce), seed))
+            val noncedSeed = Bytes.concat(Ints.toByteArray(config.nonce), seed)
+            val noncedSeedString = Base58.encode(noncedSeed)
+            println(s"Nonced seed: $noncedSeedString")
+            val accountSeed = HashChain.hash(noncedSeed)
             val accountSeedString = Base58.encode(accountSeed)
             println(s"Account seed: $accountSeedString")
 
@@ -139,7 +157,57 @@ object TxGenerator extends App {
             if (errors != 0) println(s"Invalid transactions: $errors")
             println(s"Records processed: ${created + errors}")
           case TransactionSending =>
-          //  for (group <- reader.readAll grouped config.limit) {
+            println(s"Processing file: ${config.transactions}")
+            val reader = new CSVReader(new FileReader(config.transactions))
+
+            val failedTransactionsFile = new File(config.transactions.getName + ".failed")
+            failedTransactionsFile.createNewFile()
+            val writer = new CSVWriter(new FileWriter(failedTransactionsFile))
+
+            val publicKeyString = Base58.encode(config.publicKey)
+
+            var posted = 0
+            var failed = 0
+            for (group <- reader.readAll grouped config.limit) {
+              for (row <- group) {
+                val timeString = row(0)
+                val signatureString = row(1)
+                val transactionString = row(2)
+
+                val timeResult = Try(DateTime.parse(timeString))
+                val signatureResult = Base58.decode(signatureString)
+                val transactionResult = Base58.decode(transactionString)
+
+                if (timeResult.isSuccess && signatureResult.isSuccess && transactionResult.isSuccess) {
+                  val time = timeResult.get
+                  val transactionBytes = transactionResult.get
+
+                  val now = DateTime.now
+                  if (time.isBefore(now)) {
+                    val transaction = PaymentTransaction.parseBytes(transactionBytes.tail)
+                    if (transaction.isSuccess) {
+                      val request = getRequest(config.host, config.port, config.https)
+
+                      postTransaction(publicKeyString, request, transaction.get)
+                      posted += 1
+                    } else {
+                      println(s"Failed to deserialize transaction from string '$transactionString'")
+                      writer.writeNext(row)
+                      failed += 1
+                    }
+                  } else {
+                    val diff = new Duration(now, time)
+                    val minutes = diff.getStandardMinutes
+                    println(s"Skipping future transaction with signature '$signatureString', wait for $minutes minutes to try again")
+                    writer.writeNext(row)
+                    failed += 1
+                  }
+                }
+              }
+              println("Waiting for transactions to be applied...")
+            }
+            println(s"Transactions posted: $posted")
+            println(s"Failed to post $failed transactions")
         }
       }
       case None =>
@@ -166,6 +234,30 @@ object TxGenerator extends App {
       case None =>
         None
     }
+  }
+
+  def getRequest(h: String, port: Int, secured: Boolean): Req = {
+    if (secured) host(h, port).secure else host(h, port)
+  }
+
+  def postTransaction(senderPublicKey: String, req: Req, transaction: PaymentTransaction): String = {
+    val signatureBase58 = Base58.encode(transaction.signature)
+    val recipientBase58 = Base58.encode(transaction.recipient.bytes)
+
+    val wavesPayment = WavesPayment(transaction.timestamp, transaction.amount, transaction.fee,
+      senderPublicKey, recipientBase58, signatureBase58)
+    val body = Json.toJson(wavesPayment).toString
+
+    val request = req / "waves" / "external-payment" << body
+
+    def post = request.POST
+    def requestWithContentType = post.setContentType("application/json", "UTF-8")
+
+    val reply = Http(requestWithContentType OK as.String)
+    for (r <- reply)
+      println(r)
+
+    signatureBase58
   }
 
   def getAccount(addressCandidate: String): Option[Account] = {

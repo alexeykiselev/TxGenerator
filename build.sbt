@@ -9,7 +9,7 @@ resolvers += "SonaType" at "https://oss.sonatype.org/content/groups/public"
 libraryDependencies ++= Seq(
   "com.opencsv" % "opencsv" % "3.7",
   "com.github.scopt" %% "scopt" % "3.4.+",
-  "com.typesafe.akka" %% "akka-http-core" % "2.4.6",
+  "net.databinder.dispatch" %% "dispatch-core" % "0.11.2",
   "org.consensusresearch" % "scrypto_2.11" % "1.0.+",
   "org.consensusresearch" %% "scorex-transaction" % "1.2.8-SNAPSHOT")
 
