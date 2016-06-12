@@ -6,6 +6,8 @@ target
 *.class
 *.log
 *.csv
+*.failed
+*.rejected
 
 
 # Idea

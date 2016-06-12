@@ -4,9 +4,10 @@ import java.io.{File, FileReader, FileWriter}
 
 import com.google.common.primitives.{Bytes, Ints}
 import com.opencsv.{CSVReader, CSVWriter}
-import dispatch._, Defaults._
+import dispatch.Defaults._
+import dispatch._
+import org.joda.time.DateTime
 import org.joda.time.{Duration => JodaDuration}
-import org.joda.time.{DateTime}
 import play.api.libs.json._
 import scopt.OptionParser
 import scorex.account.{Account, PrivateKeyAccount}
@@ -15,6 +16,7 @@ import scorex.transaction.PaymentTransaction
 
 import scala.annotation.tailrec
 import scala.collection.JavaConversions._
+import scala.collection.mutable
 import scala.concurrent.Await
 import scala.concurrent.duration._
 import scala.io.StdIn
@@ -40,6 +42,8 @@ case class TxGeneratorConfiguration(mode: Mode = SeedGeneration,
                                     port: Int = 6869,
                                     https: Boolean = false,
                                     limit: Int = 100,
+                                    delay: Int = 15000,
+                                    iterations: Int = 12,
                                     nonce: Int = 0)
 
 object TxGenerator extends App {
@@ -104,12 +108,14 @@ object TxGenerator extends App {
           c.copy(publicKey = if (Base58.decode(x).isSuccess) Base58.decode(x).get else Array[Byte]())
         } validate { x =>
           if (!x.isEmpty) success else failure("Invalid Base58 string for sender public key")
-        } text "sender public key as Base58 string")
+        } text "sender public key as Base58 string",
+        opt[Int]('d', "delay") valueName "<delay>" action { (x, c) => c.copy(delay = x) } text "delay in ms between transactions checks",
+        opt[Int]('i', "iterations") valueName "<iterations>" action { (x, c) => c.copy(iterations = x) } text "transactions checks count")
       help("help") text "display this help message"
     }
 
     parser.parse(args, TxGeneratorConfiguration()) match {
-      case Some(config) => {
+      case Some(config) =>
         config.mode match {
           case SeedGeneration =>
             val seed: Array[Byte] = if (config.seed.isEmpty) {
@@ -125,10 +131,8 @@ object TxGenerator extends App {
             val seedString = Base58.encode(seed)
             println(s"Seed: $seedString")
 
-            val noncedSeed = Bytes.concat(Ints.toByteArray(config.nonce), seed)
-            val noncedSeedString = Base58.encode(noncedSeed)
-            println(s"Nonced seed: $noncedSeedString")
-            val accountSeed = HashChain.hash(noncedSeed)
+            val saltedSeed = Bytes.concat(Ints.toByteArray(config.nonce), seed)
+            val accountSeed = HashChain.hash(saltedSeed)
             val accountSeedString = Base58.encode(accountSeed)
             println(s"Account seed: $accountSeedString")
 
@@ -172,74 +176,166 @@ object TxGenerator extends App {
             println(s"Processing file: ${config.transactions}")
             val reader = new CSVReader(new FileReader(config.transactions))
 
-            val failedTransactionsFile = new File(config.transactions.getName + ".failed")
-            failedTransactionsFile.createNewFile()
-            val writer = new CSVWriter(new FileWriter(failedTransactionsFile))
+            val failed = mutable.Buffer[Array[String]]()
+            val rejected = mutable.Buffer[String]()
 
-            val publicKeyString = Base58.encode(config.publicKey)
-
-            var posted = 0
-            var failed = 0
             for (group <- reader.readAll grouped config.limit) {
-              for (row <- group) {
-                val timeString = row(0)
-                val signatureString = row(1)
-                val transactionString = row(2)
+              val t0 = System.currentTimeMillis
+              val (failedRows, payments) = splitEitherSeq(convertToPayments(config, group))
+              val postResults = postPayments(config, payments)
 
-                val timeResult = Try(DateTime.parse(timeString))
-                val signatureResult = Base58.decode(signatureString)
-                val transactionResult = Base58.decode(transactionString)
+              val successfulReplies = extractValueSeq(collectResults(postResults))
+              val signaturesToCheck = convertToSignatures(successfulReplies)
 
-                if (timeResult.isSuccess && signatureResult.isSuccess && transactionResult.isSuccess) {
-                  val time = timeResult.get
-                  val transactionBytes = transactionResult.get
+              val (acceptedSignatures, rejectedSignatures) = checkSignatures(config, config.iterations, signaturesToCheck)
 
-                  val now = DateTime.now
-                  if (time.isBefore(now)) {
-                    val transaction = PaymentTransaction.parseBytes(transactionBytes)
-                    if (transaction.isSuccess) {
-                      val request = getRequest(config.host, config.port, config.https)
+              val spent = new JodaDuration(System.currentTimeMillis() - t0)
+              println(s"Accepted ${acceptedSignatures.size} of ${group.size} in ${spent.getStandardSeconds} seconds")
 
-                      postTransaction(publicKeyString, request, transaction.get) match {
-                        case None =>
-                          failed += 1
-                          writer.writeNext(row)
-                        case Some(reply) =>
-                          val json = Json.parse(reply)
-                          val signature = (json \ "signature").get.as[String]
-                          println(s"SIGNATURE: $signature")
-                          posted += 1
-                          Thread.sleep(15000)
-                          checkTransaction(request, signature) match {
-                            case Some(reply) =>
-                              println(s"REPLY: ${reply.toString}")
-                            case None =>
-                              println("FUCK!")
-                          }
-                      }
-                    } else {
-                      println(s"Failed to deserialize transaction from string '$transactionString'")
-                      writer.writeNext(row)
-                      failed += 1
-                    }
-                  } else {
-                    val diff = new JodaDuration(now, time)
-                    val minutes = diff.getStandardMinutes
-                    println(s"Skipping future transaction with signature '$signatureString', wait for $minutes minutes to try again")
-                    writer.writeNext(row)
-                    failed += 1
-                  }
-                }
-              }
-              println("Waiting for transactions to be applied...")
+              failed ++= failedRows
+              rejected ++= rejectedSignatures
             }
-            println(s"Transactions posted: $posted")
-            println(s"Failed to post $failed transactions")
+
+            dumpFailedRows(failed, config.transactions.getName)
+            dumpRejectedSignatures(rejected, config.transactions.getName)
 
             Http.shutdown()
         }
-      }
       case None =>
+    }
+  }
+
+  def dumpFailedRows(rows: Seq[Array[String]], filename: String) = {
+    if (rows.nonEmpty) {
+      val failedRowsFile = new File(filename + ".failed")
+      failedRowsFile.createNewFile()
+
+      val writer = new CSVWriter(new FileWriter(failedRowsFile))
+      writer.writeAll(rows)
+      writer.close()
+    }
+  }
+
+  def dumpRejectedSignatures(signatures: Seq[String], filename: String) = {
+    if (signatures.nonEmpty) {
+      val rejectedSignaturesFile = new File(filename + ".rejected")
+      rejectedSignaturesFile.createNewFile()
+
+      val writer = new CSVWriter(new FileWriter(rejectedSignaturesFile))
+      val rows = signatures.map(signature => Array[String](signature))
+      writer.writeAll(rows)
+      writer.close()
+    }
+  }
+
+  def splitEitherSeq[A, B](list: Seq[Either[A, B]]): (Seq[A], Seq[B]) = {
+    val (lefts, rights) = list.partition(_.isLeft)
+
+    (lefts.map(_.left.get), rights.map(_.right.get))
+  }
+
+  def extractValueSeq[A](seq: Seq[Option[A]]): Seq[A] = {
+    val definedValues: Seq[Option[A]] = seq.filter(_.isDefined)
+
+    definedValues.map(_.get)
+  }
+
+  def convertToPayments(config: TxGeneratorConfiguration, rows: Seq[Array[String]]): Seq[Either[Array[String], WavesPayment]] = {
+    rows.map(row => convertRowToWavesPayment(config, row))
+  }
+
+  def convertRowToWavesPayment(config: TxGeneratorConfiguration, row: Array[String]): Either[Array[String], WavesPayment] = {
+    val timeString = row(0)
+    val signatureString = row(1)
+    val transactionString = row(2)
+
+    val timeResult = Try(DateTime.parse(timeString))
+    val signatureResult = Base58.decode(signatureString)
+    val transactionResult = Base58.decode(transactionString)
+
+    if (timeResult.isSuccess && signatureResult.isSuccess && transactionResult.isSuccess) {
+      val time = timeResult.get
+      val transactionBytes = transactionResult.get
+
+      val now = DateTime.now
+      if (time.isBefore(now)) {
+        val parseResult = PaymentTransaction.parseBytes(transactionBytes)
+        if (parseResult.isSuccess) {
+          val transaction = parseResult.get
+          val senderPublicKeyBase58 = Base58.encode(config.publicKey)
+          val signatureBase58 = Base58.encode(transaction.signature)
+          val recipientBase58 = Base58.encode(transaction.recipient.bytes)
+          Right(WavesPayment(transaction.timestamp, transaction.amount, transaction.fee, senderPublicKeyBase58, recipientBase58, signatureBase58))
+        } else Left(row)
+      } else Left(row)
+    } else Left(row)
+  }
+
+  def postPayments(config: TxGeneratorConfiguration, payments: Seq[WavesPayment]): Seq[Future[Option[String]]] = {
+    val request = getRequest(config.host, config.port, config.https)
+
+    payments.map(payment => postPayment(request, payment))
+  }
+
+  def postPayment(req: Req, payment: WavesPayment): Future[Option[String]] = {
+    val body = Json.toJson(payment).toString
+    val request = req / "waves" / "external-payment" << body
+
+    def post = request.POST
+    def requestWithContentType = post.setContentType("application/json", "UTF-8")
+
+    Http(requestWithContentType OK as.String).option
+  }
+
+  def collectResults(futures: Seq[Future[Option[String]]]): Seq[Option[String]] = {
+    val result: Future[Seq[Option[String]]] = Future.sequence(futures)
+
+    Await.result(result, Duration.Inf)
+  }
+
+  def convertToSignatures(replies: Seq[String]): Seq[String] = {
+    replies.map(reply => extractSignature(reply)).filter(o => o.isDefined).map(o => o.get)
+  }
+
+  def checkSignaturesOnServer(config: TxGeneratorConfiguration, signatures: Seq[String]): Seq[Future[Option[String]]] = {
+    val request = getRequest(config.host, config.port, config.https)
+
+    signatures.map(signature => checkSignature(request, signature))
+  }
+
+  def checkSignature(req: Req, signature: String): Future[Option[String]] = {
+    val request = req / "transactions" / "info" / signature
+
+    Http(request OK as.String).option
+  }
+
+  @tailrec
+  def checkSignatures(config: TxGeneratorConfiguration, iteration: Int, signatures: Seq[String]): (Seq[String], Seq[String]) = {
+    println("entering sleep")
+    Thread.sleep(config.delay)
+    println("wake up")
+
+    val i = iteration - 1
+    println(s"i after decrement: $i")
+
+    val results = checkSignaturesOnServer(config, signatures)
+    val replies = extractValueSeq(collectResults(results))
+
+    val acceptedSignatures = extractValueSeq(replies.map(reply => extractSignature(reply)))
+    val rejectedSignatures = signatures.filterNot(acceptedSignatures contains)
+
+    if (rejectedSignatures.isEmpty || i == 0) (acceptedSignatures, rejectedSignatures)
+    else checkSignatures(config, i, rejectedSignatures)
+  }
+
+  def extractSignature(reply: String): Option[String] = {
+    val json = Json.parse(reply)
+
+    (json \ "signature").toOption match {
+      case Some(value) =>
+        Some(value.as[String])
+      case None =>
+        None
     }
   }
 
@@ -267,32 +363,6 @@ object TxGenerator extends App {
 
   def getRequest(h: String, port: Int, secured: Boolean): Req = {
     if (secured) host(h, port).secure else host(h, port)
-  }
-
-  def postTransaction(senderPublicKey: String, req: Req, transaction: PaymentTransaction): Option[String] = {
-    val signatureBase58 = Base58.encode(transaction.signature)
-    val recipientBase58 = Base58.encode(transaction.recipient.bytes)
-
-    val wavesPayment = WavesPayment(transaction.timestamp, transaction.amount, transaction.fee,
-      senderPublicKey, recipientBase58, signatureBase58)
-    val body = Json.toJson(wavesPayment).toString
-
-    val request = req / "waves" / "external-payment" << body
-
-    def post = request.POST
-    def requestWithContentType = post.setContentType("application/json", "UTF-8")
-
-    val futureReply = Http(requestWithContentType OK as.String).option
-
-    Await.result(futureReply, 5.seconds)
-  }
-
-  def checkTransaction(req: Req, signature: String): Option[String] = {
-    val request = req / "transactions" / "info" / signature
-
-    val futureReply = Http(request OK as.String).option
-
-    Await.result(futureReply, 5.seconds)
   }
 
   def getAccount(addressCandidate: String): Option[Account] = {
