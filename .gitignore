@@ -6,9 +6,11 @@ target
 *.class
 *.log
 *.csv
+*.txs
 *.failed
 *.rejected
 
+.history
 
 # Idea
 

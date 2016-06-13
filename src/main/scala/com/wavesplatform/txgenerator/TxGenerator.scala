@@ -30,6 +30,8 @@ case object TransactionGeneration extends Mode
 
 case object TransactionSending extends Mode
 
+case object Checking extends Mode
+
 case class TxGeneratorConfiguration(mode: Mode = SeedGeneration,
                                     transactions: File = new File("transaction.csv"),
                                     output: File = new File("output.csv"),
@@ -111,6 +113,23 @@ object TxGenerator extends App {
         } text "sender public key as Base58 string",
         opt[Int]('d', "delay") valueName "<delay>" action { (x, c) => c.copy(delay = x) } text "delay in ms between transactions checks",
         opt[Int]('i', "iterations") valueName "<iterations>" action { (x, c) => c.copy(iterations = x) } text "transactions checks count")
+      cmd("check") action { (_, c) =>
+        c.copy(mode = Checking)
+      } text "Check transactions on server" children(
+        opt[File]('f', "file") required() valueName "<file>" action { (x, c) =>
+          c.copy(transactions = x)
+        } validate { x =>
+          if (x.exists()) success else failure(s"Failed to open file $x")
+        } text "path to transactions file",
+        opt[File]('o', "output") required() valueName "<output-file>" action { (x, c) =>
+          c.copy(output = x)
+        } text "path to report file",
+        opt[String]('h', "host") required() valueName "<host>" action { (x, c) =>
+          c.copy(host = x)
+        } text "node host name or IP address",
+        opt[Int]('p', "port") valueName "<port>" action { (x, c) => c.copy(port = x) } text "node port number",
+        opt[Int]('l', "limit") valueName "<limit>" action { (x, c) => c.copy(limit = x) } text "batch transactions limit",
+        opt[Unit]('s', "https") action { (_, c) => c.copy(https = true) } text "use HTTPS connection")
       help("help") text "display this help message"
     }
 
@@ -149,12 +168,13 @@ object TxGenerator extends App {
 
             val reader = new CSVReader(new FileReader(config.transactions))
 
+            val failed = mutable.Buffer[Array[String]]()
+
             config.output.createNewFile()
             val writer = new CSVWriter(new FileWriter(config.output))
             var created = 0
-            var errors = 0
 
-            for (row <- reader.readAll) {
+            for (row <- reader.readAll if row.size == 2) {
               val address = row(0).trim
               val amount = row(1).trim.toLong
 
@@ -165,12 +185,16 @@ object TxGenerator extends App {
                   val line = Array[String](time, Base58.encode(transaction.signature), Base58.encode(transaction.bytes))
                   writer.writeNext(line)
                 case None =>
-                  errors += 1
+                  failed += row
               }
             }
             writer.close()
             println(s"Transactions created: $created")
-            if (errors != 0) println(s"Invalid transactions: $errors")
+            val errors = failed.size
+            if (failed.nonEmpty) {
+              println(s"Invalid transactions: ${failed.size}")
+              dumpFailedRows(failed, config.transactions.getName)
+            }
             println(s"Records processed: ${created + errors}")
           case TransactionSending =>
             println(s"Processing file: ${config.transactions}")
@@ -200,6 +224,24 @@ object TxGenerator extends App {
             dumpRejectedSignatures(rejected, config.transactions.getName)
 
             Http.shutdown()
+
+          case Checking =>
+            println(s"Processing file: ${config.transactions}")
+            val reader = new CSVReader(new FileReader(config.transactions))
+
+            val accepted = mutable.Buffer[Array[String]]()
+
+            for (group <- reader.readAll grouped config.limit) {
+              val signatures = extractValueSeq(readSignatures(group))
+
+              val acceptedPayments = extractValueSeq(checkPaymentsOnServer(config, signatures))
+
+              accepted ++= acceptedPayments
+            }
+
+            dumpReport(accepted, config.output)
+
+            Http.shutdown()
         }
       case None =>
     }
@@ -223,6 +265,16 @@ object TxGenerator extends App {
 
       val writer = new CSVWriter(new FileWriter(rejectedSignaturesFile))
       val rows = signatures.map(signature => Array[String](signature))
+      writer.writeAll(rows)
+      writer.close()
+    }
+  }
+
+  def dumpReport(rows: Seq[Array[String]], output: File) = {
+    if (rows.nonEmpty) {
+      output.createNewFile()
+
+      val writer = new CSVWriter(new FileWriter(output))
       writer.writeAll(rows)
       writer.close()
     }
@@ -304,28 +356,10 @@ object TxGenerator extends App {
   }
 
   def checkSignature(req: Req, signature: String): Future[Option[String]] = {
-    val request = req / "transactions" / "info" / signature
+    val timestampString = System.currentTimeMillis().toString
+    val request = req / "transactions" / "info" / signature <<? Map("t" -> timestampString)
 
     Http(request OK as.String).option
-  }
-
-  @tailrec
-  def checkSignatures(config: TxGeneratorConfiguration, iteration: Int, signatures: Seq[String]): (Seq[String], Seq[String]) = {
-    println("entering sleep")
-    Thread.sleep(config.delay)
-    println("wake up")
-
-    val i = iteration - 1
-    println(s"i after decrement: $i")
-
-    val results = checkSignaturesOnServer(config, signatures)
-    val replies = extractValueSeq(collectResults(results))
-
-    val acceptedSignatures = extractValueSeq(replies.map(reply => extractSignature(reply)))
-    val rejectedSignatures = signatures.filterNot(acceptedSignatures contains)
-
-    if (rejectedSignatures.isEmpty || i == 0) (acceptedSignatures, rejectedSignatures)
-    else checkSignatures(config, i, rejectedSignatures)
   }
 
   def extractSignature(reply: String): Option[String] = {
@@ -337,6 +371,59 @@ object TxGenerator extends App {
       case None =>
         None
     }
+  }
+
+  def extractPayment(reply: String): Option[Array[String]] = {
+    val json = Json.parse(reply)
+
+    val signatureOption = (json \ "signature").toOption
+    val recipientOption = (json \ "recipient").toOption
+    val timestampOption = (json \ "timestamp").toOption
+    val amountOption = (json \ "amount").toOption
+    val heightOption = (json \ "height").toOption
+
+    if (signatureOption.isDefined && recipientOption.isDefined && timestampOption.isDefined &&
+      amountOption.isDefined && heightOption.isDefined) {
+      val signature = signatureOption.get.as[String]
+      val recipient = recipientOption.get.as[String]
+      val timestamp = timestampOption.get.as[Long].toString
+      val amount = amountOption.get.as[Long].toString
+      val height = heightOption.get.as[Long].toString
+
+      Some(Array(signature, s"1W$recipient", timestamp, amount, height))
+    } else
+      None
+  }
+
+  def readSignatures(rows: Seq[Array[String]]): Seq[Option[String]] = {
+    rows.map(row => readSignature(row))
+  }
+
+  def readSignature(row: Array[String]): Option[String] = {
+    if (row.size > 1)
+      Some(row(1))
+    else
+      None
+  }
+
+  @tailrec
+  def checkSignatures(config: TxGeneratorConfiguration, iteration: Int, signatures: Seq[String]): (Seq[String], Seq[String]) = {
+    Thread.sleep(config.delay)
+
+    val i = iteration - 1
+    val results = checkSignaturesOnServer(config, signatures)
+    val replies = extractValueSeq(collectResults(results))
+
+    val acceptedSignatures = extractValueSeq(replies.map(reply => extractSignature(reply)))
+    val rejectedSignatures = signatures.filterNot(acceptedSignatures contains)
+
+    if (rejectedSignatures.isEmpty || i == 0) (acceptedSignatures, rejectedSignatures)
+    else checkSignatures(config, i, rejectedSignatures)
+  }
+
+  def checkPaymentsOnServer(config: TxGeneratorConfiguration, signatures: Seq[String]): Seq[Option[Array[String]]] = {
+    val replies = extractValueSeq(collectResults(checkSignaturesOnServer(config, signatures)))
+    replies.map(r => extractPayment(r))
   }
 
   @tailrec
