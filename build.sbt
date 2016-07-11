@@ -1,19 +1,18 @@
 import sbt.Keys._
 import sbtassembly.AssemblyPlugin.autoImport._
 
-lazy val commonSettings = Seq(
+val commonSettings = Seq(
   name := "TxGenerator",
   version := "1.0.0",
   scalaVersion := "2.11.8",
   resolvers += "SonaType" at "https://oss.sonatype.org/content/groups/public",
-  assemblyJarName in assembly := "tx-gen.jar",
   mainClass in assembly := Some("com.wavesplatform.txgenerator.TxGenerator"),
-  assemblyMergeStrategy in assembly := {
+  assemblyJarName in assembly := "tx-gen-test.jar",
+  assemblyMergeStrategy in assembly <<= (mergeStrategy in assembly) { (old) => {
     case "application.conf" => MergeStrategy.concat
     case "logback.xml" => MergeStrategy.first
-    case x =>
-      val oldStrategy = (assemblyMergeStrategy in assembly).value
-      oldStrategy(x)
+    case x => old(x)
+  }
   }
 )
 
@@ -25,27 +24,28 @@ val dependencies = Seq(
   "org.consensusresearch" %% "scorex-transaction" % "1.2.8-SNAPSHOT"
 )
 
-//lazy val ProfileTestNet = config("testnet") extend (Compile)
-//lazy val ProfileMainNet = config("mainnet") extend (Compile)
+val profileMainNet = config("mainnet") extend Compile
 
-lazy val root = (project in file("."))
-//  .configs(ProfileMainNet, ProfileTestNet)
+val root = (project in file("."))
+  .configs(profileMainNet)
   .settings(commonSettings: _*)
   .settings(
     libraryDependencies ++= dependencies
   )
-//  .settings(
-//    managedResourceDirectories in ProfileTestNet := Seq(baseDirectory.value / "src/main/testnet/resources"),
-//
-//  )
-//  .settings(
-//    managedResourceDirectories in ProfileMainNet := Seq(baseDirectory.value / "src/main/mainnet/resources"),
-//
-//    assemblyMergeStrategy in assembly := {
-//      case "application.conf" => MergeStrategy.concat
-//      case "logback.xml" => MergeStrategy.first
-//      case x =>
-//        val oldStrategy = (assemblyMergeStrategy in assembly).value
-//        oldStrategy(x)
-//    }
-//  )
+  .settings(inConfig(profileMainNet) {
+    Classpaths.configSettings ++
+      Defaults.configTasks ++
+      baseAssemblySettings ++
+      Seq(
+        resourceDirectory in compile := baseDirectory.value / "src/main/mainnet/resources",
+        resourceDirectory in assembly := baseDirectory.value / "src/main/mainnet/resources",
+        assemblyJarName in assembly := "tx-gen-main.jar",
+        assemblyMergeStrategy in assembly <<= (mergeStrategy in assembly) {
+          (old) => {
+            case "application.conf" => MergeStrategy.concat
+            case "logback.xml" => MergeStrategy.first
+            case x => old(x)
+          }
+        }
+      )
+  }: _*)

@@ -9,6 +9,7 @@ target
 *.txs
 *.failed
 *.rejected
+*.ods
 
 .history
 

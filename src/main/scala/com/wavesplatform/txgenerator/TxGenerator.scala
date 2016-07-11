@@ -438,7 +438,7 @@ object TxGenerator extends App {
     getAccount(address) match {
       case Some(account) =>
         val senderAccount = PrivateKeyAccount(seed, privateKey, publicKey)
-        val fee = 1
+        val fee = 100000
         val timestamp = System.currentTimeMillis + offset
         val signature = PaymentTransaction.generateSignature(senderAccount, account, amount, fee, timestamp)
 
