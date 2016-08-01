@@ -21,7 +21,7 @@ val dependencies = Seq(
   "com.github.scopt" %% "scopt" % "3.4.+",
   "net.databinder.dispatch" %% "dispatch-core" % "0.11.2",
   "org.consensusresearch" % "scrypto_2.11" % "1.0.+",
-  "org.consensusresearch" %% "scorex-transaction" % "1.2.8-SNAPSHOT"
+  "org.consensusresearch" %% "scorex-transaction" % "1.2.8"
 )
 
 val profileMainNet = config("mainnet") extend Compile
