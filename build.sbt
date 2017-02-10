@@ -24,28 +24,9 @@ val dependencies = Seq(
   "org.consensusresearch" %% "scorex-transaction" % "1.2.8"
 )
 
-val profileMainNet = config("mainnet") extend Compile
-
-val root = (project in file("."))
-  .configs(profileMainNet)
+lazy val root = (project in file("."))
+  //  .configs(ProfileMainNet, ProfileTestNet)
   .settings(commonSettings: _*)
   .settings(
     libraryDependencies ++= dependencies
   )
-  .settings(inConfig(profileMainNet) {
-    Classpaths.configSettings ++
-      Defaults.configTasks ++
-      baseAssemblySettings ++
-      Seq(
-        resourceDirectory in compile := baseDirectory.value / "src/main/mainnet/resources",
-        resourceDirectory in assembly := baseDirectory.value / "src/main/mainnet/resources",
-        assemblyJarName in assembly := "tx-gen-main.jar",
-        assemblyMergeStrategy in assembly <<= (mergeStrategy in assembly) {
-          (old) => {
-            case "application.conf" => MergeStrategy.concat
-            case "logback.xml" => MergeStrategy.first
-            case x => old(x)
-          }
-        }
-      )
-  }: _*)
