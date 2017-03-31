@@ -317,7 +317,8 @@ object TxGenerator extends App {
           val senderPublicKeyBase58 = Base58.encode(config.publicKey)
           val signatureBase58 = Base58.encode(transaction.signature)
           val recipientBase58 = Base58.encode(transaction.recipient.bytes)
-          Right(WavesPayment(transaction.timestamp, transaction.amount, transaction.fee, senderPublicKeyBase58, recipientBase58, signatureBase58))
+          val sender = transaction.sender.address
+          Right(WavesPayment(transaction.timestamp, transaction.amount, transaction.fee, senderPublicKeyBase58, recipientBase58, signatureBase58, sender))
         } else Left(row)
       } else Left(row)
     } else Left(row)
@@ -331,10 +332,11 @@ object TxGenerator extends App {
 
   def postPayment(req: Req, payment: WavesPayment): Future[Option[String]] = {
     val body = Json.toJson(payment).toString
-    val request = req / "waves" / "external-payment" << body
+    val request = req / "waves" / "broadcast-signed-payment" << body
 
-    def post = request.POST
-    def requestWithContentType = post.setContentType("application/json", "UTF-8")
+    def post = request.POST.addHeader("api_key", "SK3uEXstTwWF")
+    def requestWithContentType = post.setHeader("Content-Type", "application/json").setHeader("Accept", "application/json")
+
 
     Http(requestWithContentType OK as.String).option
   }

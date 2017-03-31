@@ -3,7 +3,7 @@ package com.wavesplatform.txgenerator
 import play.api.libs.functional.syntax._
 import play.api.libs.json.{JsPath, Reads, Writes}
 
-case class WavesPayment(timestamp: Long, amount: Long, fee: Long, senderPublicKey: String, recipient: String, signature: String)
+case class WavesPayment(timestamp: Long, amount: Long, fee: Long, senderPublicKey: String, recipient: String, signature: String, sender: String)
 
 object WavesPayment {
   implicit val paymentWrites: Writes[WavesPayment] = (
@@ -12,7 +12,8 @@ object WavesPayment {
       (JsPath \ "fee").write[Long] and
       (JsPath \ "senderPublicKey").write[String] and
       (JsPath \ "recipient").write[String] and
-      (JsPath \ "signature").write[String]
+      (JsPath \ "signature").write[String] and
+      (JsPath \ "sender").write[String]
     ) (unlift(WavesPayment.unapply))
 
   implicit val paymentReads: Reads[WavesPayment] = (
@@ -21,6 +22,7 @@ object WavesPayment {
       (JsPath \ "fee").read[Long] and
       (JsPath \ "senderPublicKey").read[String] and
       (JsPath \ "recipient").read[String] and
-      (JsPath \ "signature").read[String]
+      (JsPath \ "signature").read[String] and
+      (JsPath \ "sender").read[String]
     ) (WavesPayment.apply _)
 }
